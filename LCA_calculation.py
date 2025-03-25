@@ -4,8 +4,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import norm
-import os
-
 
 class SAF_LCA_Model:
     """
@@ -82,7 +80,7 @@ class SAF_LCA_Model:
         }
     
     def set_conversion_data(self, technology, efficiency, ghg_emissions, 
-                           energy_input, water_usage, feedstock_requirement,
+                           energy_input, water_usage,
                            syngas_requirement=None, co_h2_ratio=None):
         """
         Set conversion process data
@@ -99,8 +97,6 @@ class SAF_LCA_Model:
             Energy input for conversion (MJ per kg fuel)
         water_usage : float
             Water usage (L per kg fuel)
-        feedstock_requirement : float
-            Feedstock requirement (kg feedstock per kg fuel)
         syngas_requirement : float, optional
             Syngas requirement for FT synthesis (kg syngas per kg fuel)
         co_h2_ratio : float, optional
@@ -111,8 +107,7 @@ class SAF_LCA_Model:
             "efficiency": efficiency,
             "ghg_emissions": ghg_emissions,
             "energy_input": energy_input,
-            "water_usage": water_usage,
-            "feedstock_requirement": feedstock_requirement
+            "water_usage": water_usage
         }
         
         # Add additional parameters for e-fuel pathway if provided
@@ -264,12 +259,14 @@ class SAF_LCA_Model:
         if electricity_sources is None:
             electricity_sources = [
                 "renewable_mix", "grid_global", "grid_eu", "grid_us", 
-                "grid_china", "natural_gas", "coal", "solar", "wind", "hydro"
+                "grid_china", "natural_gas", "coal", "solar", "wind", "hydro", "renewable"
             ]
         
         # Store original parameters to restore later
         original_source = self.electrolysis_data.get("electricity_source", "renewable")
         original_intensity = self.electrolysis_data.get("electricity_carbon_intensity", 0.020)
+        original_co = self.electrolysis_data.get("energy_input_co", 28.0)
+        original_h2 = self.electrolysis_data.get("energy_input_h2", 55.0)
         
         results = []
         
@@ -280,24 +277,32 @@ class SAF_LCA_Model:
                 co2_electrolysis_efficiency=self.electrolysis_data["co2_electrolysis_efficiency"],
                 water_electrolysis_efficiency=self.electrolysis_data["water_electrolysis_efficiency"],
                 electricity_source=source,  # New source
-                energy_input_co=self.electrolysis_data["energy_input_co"],
-                energy_input_h2=self.electrolysis_data["energy_input_h2"],
+                energy_input_co=original_co,
+                energy_input_h2=original_h2,
                 water_usage=self.electrolysis_data["water_usage"],
                 electricity_carbon_intensity=None  # Use default from source
             )
             
             # Calculate LCA with new parameters
             self.calculate_lca()
-            emission_reduction = self.calculate_emission_reduction()
+            
+            # 直接计算减排率而不调用函数
+            if self.functional_unit == "MJ":
+                saf_emissions = self.results["ghg_emissions"]["total"] * 1000  # kg to g
+            else:
+                energy_density = self.use_phase_data["energy_density"]  # MJ/kg
+                saf_emissions = self.results["ghg_emissions"]["total"] * 1000 / energy_density
+                
+            emission_reduction = (89.0 - saf_emissions) / 89.0 * 100
             
             # Store results
             results.append({
                 'electricity_source': source,
                 'carbon_intensity': self.electrolysis_data["electricity_carbon_intensity"],
-                'saf_emissions_mjbasis': self.results["ghg_emissions"]["total"] * 1000 / self.use_phase_data["energy_density"] if self.functional_unit != "MJ" else self.results["ghg_emissions"]["total"] * 1000,
+                'saf_emissions_mjbasis': saf_emissions,
                 'emission_reduction': emission_reduction,
                 'electrolysis_emissions': self.results["ghg_emissions"]["electrolysis"] * 1000 / self.use_phase_data["energy_density"] if self.functional_unit != "MJ" else self.results["ghg_emissions"]["electrolysis"] * 1000,
-                'total_emissions': self.results["ghg_emissions"]["total"] * 1000 / self.use_phase_data["energy_density"] if self.functional_unit != "MJ" else self.results["ghg_emissions"]["total"] * 1000
+                'total_emissions': saf_emissions
             })
         
         # Restore original parameters
@@ -305,11 +310,14 @@ class SAF_LCA_Model:
             co2_electrolysis_efficiency=self.electrolysis_data["co2_electrolysis_efficiency"],
             water_electrolysis_efficiency=self.electrolysis_data["water_electrolysis_efficiency"],
             electricity_source=original_source,
-            energy_input_co=self.electrolysis_data["energy_input_co"],
-            energy_input_h2=self.electrolysis_data["energy_input_h2"],
+            energy_input_co=original_co,
+            energy_input_h2=original_h2,
             water_usage=self.electrolysis_data["water_usage"],
             electricity_carbon_intensity=original_intensity
         )
+        
+        # 重新计算以恢复原始结果
+        self.calculate_lca()
         
         # Create DataFrame from results
         df = pd.DataFrame(results)
@@ -420,7 +428,9 @@ class SAF_LCA_Model:
             raise ValueError(f"Unsupported functional unit: {self.functional_unit}")
         
         # Carbon capture stage (DAC)
-        carbon_capture_ghg = self.carbon_capture_data["ghg_emissions"] * self.carbon_capture_data["co2_capture_rate"] * normalization_factor
+        # 考虑捕获效率影响
+        actual_co2_needed = self.carbon_capture_data["co2_capture_rate"] / (self.carbon_capture_data["capture_efficiency"] / 100)
+        carbon_capture_ghg = self.carbon_capture_data["ghg_emissions"] * actual_co2_needed * normalization_factor
         
         # Electrolysis stage (CO2 to CO and H2O to H2)
         # Convert electricity carbon intensity from kg CO2e/kWh to kg CO2e/MJ
@@ -433,8 +443,13 @@ class SAF_LCA_Model:
         co_needed = total_syngas_needed * (co_h2_ratio / (1 + co_h2_ratio))
         h2_needed = total_syngas_needed * (1 / (1 + co_h2_ratio))
         
-        co_emissions = co_needed * self.electrolysis_data["energy_input_co"] * elec_intensity_mj
-        h2_emissions = h2_needed * self.electrolysis_data["energy_input_h2"] * elec_intensity_mj
+        # 考虑电解效率影响
+        actual_co_needed = co_needed / (self.electrolysis_data["co2_electrolysis_efficiency"] / 100)
+        actual_h2_needed = h2_needed / (self.electrolysis_data["water_electrolysis_efficiency"] / 100)
+        
+        # 修正的排放计算
+        co_emissions = actual_co_needed * self.electrolysis_data["energy_input_co"] * elec_intensity_mj
+        h2_emissions = actual_h2_needed * self.electrolysis_data["energy_input_h2"] * elec_intensity_mj
         
         electrolysis_ghg = co_emissions + h2_emissions
         
@@ -462,11 +477,11 @@ class SAF_LCA_Model:
         
         # Calculate energy consumption
         # Carbon capture energy
-        carbon_capture_energy = self.carbon_capture_data["energy_requirement"] * self.carbon_capture_data["co2_capture_rate"] * normalization_factor
+        carbon_capture_energy = (self.carbon_capture_data["energy_requirement"] * actual_co2_needed) * normalization_factor
         
-        # Electrolysis energy
-        co_energy = co_needed * self.electrolysis_data["energy_input_co"]
-        h2_energy = h2_needed * self.electrolysis_data["energy_input_h2"]
+        # Electrolysis energy - 考虑电解效率
+        co_energy = actual_co_needed * self.electrolysis_data["energy_input_co"]
+        h2_energy = actual_h2_needed * self.electrolysis_data["energy_input_h2"]
         electrolysis_energy = (co_energy + h2_energy) * normalization_factor
         
         # Conversion and distribution energy
@@ -485,7 +500,7 @@ class SAF_LCA_Model:
         }
         
         # Calculate water usage
-        carbon_capture_water = self.carbon_capture_data["water_usage"] * self.carbon_capture_data["co2_capture_rate"] * normalization_factor
+        carbon_capture_water = self.carbon_capture_data["water_usage"] * actual_co2_needed * normalization_factor
         electrolysis_water = self.electrolysis_data["water_usage"] * total_syngas_needed
         conversion_water = self.conversion_data["water_usage"] * normalization_factor
         
@@ -565,17 +580,20 @@ class SAF_LCA_Model:
             
         elif plot_type == "comparison":
             # Comparison with fossil jet fuel
-            reduction = self.calculate_emission_reduction()
+            fossil_jet_emissions = 89.0  # g CO2e/MJ
             
             if self.functional_unit == "MJ":
                 saf_emissions = self.results["ghg_emissions"]["total"] * 1000  # kg to g
             else:
                 energy_density = self.use_phase_data["energy_density"]  # MJ/kg
                 saf_emissions = self.results["ghg_emissions"]["total"] * 1000 / energy_density
-                
+            
+            # 直接计算减排率而不调用函数（避免重复打印）
+            reduction_pct = (fossil_jet_emissions - saf_emissions) / fossil_jet_emissions * 100
+            
             emissions = [89.0, saf_emissions]  # Fossil jet vs SAF
             plt.bar(["Fossil Jet Fuel", f"{self.pathway} SAF"], emissions)
-            plt.title(f"Emissions Comparison: {reduction:.1f}% Reduction")
+            plt.title(f"Emissions Comparison: {reduction_pct:.1f}% Reduction")
             plt.ylabel("GHG Emissions (g CO2e/MJ)")
             
         plt.tight_layout()
@@ -590,50 +608,57 @@ if __name__ == "__main__":
     # Set data for each life cycle stage for e-fuel pathway
     # Values are illustrative and should be replaced with actual data
     
+    # Use phase (carbon neutral if CO2 from air)
+    model.set_use_phase_data(
+        combustion_emissions=0.0,  # kg CO2e/kg fuel (carbon neutral with DAC)
+        energy_density=43.0        # MJ/kg fuel (更新为C₁₂H₂₆的能量密度)
+    )
+
     # Carbon capture: Direct Air Capture (DAC)
+    # 12 mol CO2 needed per mol C₁₂H₂₆
+    # 12 mol CO2 * 44 g/mol = 528 g CO2 per 170.33 g fuel
+    # = 3.1 kg CO2/kg fuel
     model.set_carbon_capture_data(
-        capture_efficiency=80.0,  # %
-        energy_requirement=8.5,   # MJ/kg CO2
-        ghg_emissions=0.3,        # kg CO2e/kg CO2 captured
-        water_usage=5.0,          # L/kg CO2 captured
-        co2_capture_rate=2.8      # kg CO2/kg fuel 
+        capture_efficiency=80.0,    # %
+        energy_requirement=30.0,    # MJ/kg CO2
+        ghg_emissions=0.08,         # kg CO2e/kg CO2 captured (使用绿电)
+        water_usage=5.0,            # L/kg CO2 captured
+        co2_capture_rate=3.1        # kg CO2/kg fuel (基于C₁₂H₂₆计算)
     )
     
     # Electrolysis for CO2 to CO and H2O to H2
     model.set_electrolysis_data(
-        co2_electrolysis_efficiency=70.0,  # %
-        water_electrolysis_efficiency=75.0,  # %
-        electricity_source="renewable",      # Assuming renewable electricity
-        energy_input_co=15.0,               # MJ/kg CO
-        energy_input_h2=45.0,               # MJ/kg H2 (typically higher)
-        water_usage=20.0,                    # L/kg H2+CO produced
+        co2_electrolysis_efficiency=65.0,  # % (AEM技术典型效率)
+        water_electrolysis_efficiency=75.0, # %
+        electricity_source="renewable",     # 使用可再生电力
+        energy_input_co=28.0,              # MJ/kg CO (AEM技术能耗更低)
+        energy_input_h2=55.0,              # MJ/kg H2
+        water_usage=20.0,                  # L/kg H2+CO produced
         electricity_carbon_intensity=None
     )
     
     # Conversion process: Fischer-Tropsch
+    # 计算合成气需求：
+    # 每摩尔C₁₂H₂₆需要12摩尔CO和13摩尔H2
+    # CO: 12 mol * 28 g/mol = 336 g CO
+    # H2: 13 mol * 2 g/mol = 26 g H2
+    # 总合成气 = 362 g per 170.33 g fuel = 2.13 kg syngas/kg fuel
     model.set_conversion_data(
         technology="Fischer-Tropsch",
-        efficiency=0.65,          # MJ fuel/MJ feedstock
-        ghg_emissions=0.2,        # kg CO2e/kg fuel (lower for e-fuel pathway)
-        energy_input=8.0,         # MJ/kg fuel
+        efficiency=0.65,          # MJ fuel/MJ feedstock，暂时没用
+        ghg_emissions=0.2,        # kg CO2e/kg fuel
+        energy_input=25.0,        # MJ/kg fuel
         water_usage=5.0,          # L/kg fuel
-        feedstock_requirement=0,  # Not used in this pathway
-        syngas_requirement=2.8,   # kg syngas/kg fuel
-        co_h2_ratio=2.1           # CO:H2 ratio for FT synthesis
+        syngas_requirement=2.13,  # kg syngas/kg fuel (基于C₁₂H₂₆计算)
+        co_h2_ratio=0.923        # CO:H2 ratio (12:13 基于C₁₂H₂₆计算)
     )
     
     # Distribution
     model.set_distribution_data(
         transport_distance=500.0,  # km
         transport_mode="truck",
-        ghg_emissions=0.05,   # kg CO2e/kg fuel
-        energy_input=0.8     # MJ/kg fuel
-    )
-    
-    # Use phase (carbon neutral if CO2 from air)
-    model.set_use_phase_data(
-        combustion_emissions=0.0,  # kg CO2e/kg fuel (carbon neutral with DAC)
-        energy_density=44.0   # MJ/kg fuel
+        ghg_emissions=0.05,       # kg CO2e/kg fuel
+        energy_input=2.0          # MJ/kg fuel (更新为更实际的值)
     )
     
     # Calculate LCA
@@ -642,17 +667,29 @@ if __name__ == "__main__":
     # Calculate emission reduction compared to fossil jet fuel
     reduction = model.calculate_emission_reduction()
     
-    # Print results
-    print(f"GHG Emissions Breakdown (g CO2e/MJ):")
+    # 1. 打印各阶段温室气体排放
+    print("\nGHG Emissions Breakdown (g CO2e/MJ):")
     for stage, value in results["ghg_emissions"].items():
         print(f"  {stage}: {value*1000:.2f}")
     
-    print(f"\nEmission reduction compared to fossil jet fuel: {reduction:.2f}%")
+    # 2. 打印各阶段能量消耗
+    print("\nEnergy Consumption Breakdown (MJ/functional_unit):")
+    for stage, value in results["energy_consumption"].items():
+        print(f"  {stage}: {value:.2f}")
+    
+    # 3. 打印各阶段水资源使用
+    print("\nWater Usage Breakdown (L/functional_unit):")
+    for stage, value in results["water_usage"].items():
+        print(f"  {stage}: {value:.2f}")
+    
+    # 5. 打印能源效率分析
+    print("\nEnergy Efficiency Analysis:")
+    print(f"  DAC Energy Share: {(results['energy_consumption']['carbon_capture']/results['energy_consumption']['total']*100):.1f}%")
+    print(f"  Electrolysis Energy Share: {(results['energy_consumption']['electrolysis']/results['energy_consumption']['total']*100):.1f}%")
+    print(f"  FT Synthesis Energy Share: {(results['energy_consumption']['conversion']/results['energy_consumption']['total']*100):.1f}%")
     
     # Analyze the impact of different electricity sources
     electricity_analysis = model.analyze_electricity_sources()
-    print("\nElectricity Source Analysis Results:")
-    print(electricity_analysis[["electricity_source", "carbon_intensity", "saf_emissions_mjbasis", "emission_reduction"]])
     
     # Plot the results
     model.plot_electricity_analysis(electricity_analysis, plot_type="emissions")
